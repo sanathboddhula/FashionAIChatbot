@@ -1,56 +1,104 @@
+import openai
+import pinecone
 import streamlit as st
-from openai import OpenAI
+from pinecone import Pinecone
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+def initialize_services():
+    """Initialize OpenAI and Pinecone services."""
+    openai.api_key = st.secrets["OPENAI_API_KEY"]
+    pc = Pinecone(api_key=st.secrets["PINECONE_API_KEY"],
+                  environment="us-east-1-aws")
+    index_name = "fashionproducts"
+    index = pc.Index(index_name, "https://fashionproducts-zn0fky7.svc.aped-4627-b74a.pinecone.io")
+    return index
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+def generate_query_embedding(query):
+    """Generate an embedding for the user's query using OpenAI."""
+    response = openai.Embedding.create(
+        input=query,
+        model="text-embedding-ada-002"
+    )
+    return response['data'][0]['embedding']
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+def search_pinecone(index, query_embedding, top_k=5):
+    """Perform a semantic search in Pinecone with the query embedding."""
+    search_results = index.query(
+        vector=query_embedding,
+        top_k=top_k,
+        include_metadata=True
+    )
+    return search_results
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+def format_results_as_stylist_response(search_results, query):
+    """Use OpenAI to format search results into a conversational response."""
+    products = [
+        {
+            "name": match['metadata']['name'],
+            "category": match['metadata']['category'],
+            "price": match['metadata']['price'],
+            "description": match['metadata'].get('description', ''),
+            "url": match['metadata']['url']
+        }
+        for match in search_results['matches']
+    ]
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    # Create the rows for the table
+    product_rows = "\n".join(
+        f"| {product['name']} | {product['category']} | {product['price']} | {product['description']} | [Link]({product['url']}) |"
+        for product in products
+    )
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+    # Construct the stylist prompt
+    stylist_prompt = f"""
+    You are a personal stylist. The user is looking for fashion recommendations based on the following query: "{query}". 
+    Based on the products retrieved from a database, craft a conversational response as a stylist, explaining why these products are great choices.
+    Here are the products presented in a tabular format:
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    | **Name**                        | **Category** | **Price ($)** | **Description**                            | **URL**                     |
+    |----------------------------------|--------------|---------------|--------------------------------------------|-----------------------------|
+    {product_rows}
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+    After presenting the table, provide a friendly and stylish response. Be creative and make it engaging.
+    """
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You are a fashion stylist."},
+            {"role": "user", "content": stylist_prompt}
+        ]
+    )
+
+    return response['choices'][0]['message']['content']
+
+def main():
+    """Streamlit UI for the Fashion AI Chatbot."""
+    st.title("Fashion AI Chatbot")
+    st.write("Ask for fashion recommendations and let the AI stylist help you find the perfect items!")
+
+    # User Input
+    query = st.text_input("What are you looking for?", placeholder="e.g., comfortable black shirts")
+
+    if st.button("Get Recommendations"):
+        if query:
+            # Initialize services
+            with st.spinner("Fetching recommendations..."):
+                index = initialize_services()
+                
+                # Generate query embedding
+                query_embedding = generate_query_embedding(query)
+                
+                # Search Pinecone
+                search_results = search_pinecone(index, query_embedding)
+                
+                # Format results into stylist response
+                stylist_response = format_results_as_stylist_response(search_results, query)
+
+            # Display the recommendations
+            st.subheader("Your Personal Stylist Recommends:")
+            st.markdown(stylist_response, unsafe_allow_html=True)
+        else:
+            st.error("Please enter a query to get recommendations.")
+
+if __name__ == "__main__":
+    main()
